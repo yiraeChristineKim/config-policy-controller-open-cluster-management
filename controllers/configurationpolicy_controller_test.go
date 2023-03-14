@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -752,5 +753,90 @@ func TestShouldEvaluatePolicy(t *testing.T) {
 				}
 			},
 		)
+	}
+}
+
+func TestShouldHandleSingleKeyFalse(t *testing.T) {
+	t.Parallel()
+
+	var unstruct unstructured.Unstructured
+	var unstructObj unstructured.Unstructured
+
+	var update, skip bool
+
+	tests := [][]map[string]interface{}{
+		{
+			{
+				"hostIPC":   false,
+				"container": "test",
+			},
+			{
+				"container": "test",
+			},
+			{
+				"key":    "hostIPC",
+				"expect": false,
+			},
+		},
+		{
+			{
+				"container": map[string]interface{}{
+					"image":   "nginx1.7.9",
+					"name":    "nginx",
+					"hostIPC": false,
+				},
+			},
+			{
+				"container": map[string]interface{}{
+					"image": "nginx1.7.9",
+					"name":  "nginx",
+				},
+			},
+			{
+				"key":    "container",
+				"expect": false,
+			},
+		},
+		{
+			{
+				"hostIPC":   true,
+				"container": "test",
+			},
+			{
+				"container": "test",
+			},
+			{
+				"key":    "hostIPC",
+				"expect": true,
+			},
+		},
+		{
+			{
+				"container": map[string]interface{}{
+					"image":   "nginx1.7.9",
+					"name":    "nginx",
+					"hostIPC": true,
+				},
+			},
+			{
+				"container": map[string]interface{}{
+					"image": "nginx1.7.9",
+					"name":  "nginx",
+				},
+			},
+			{
+				"key":    "container",
+				"expect": true,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		unstruct.Object = test[0]
+		unstructObj.Object = test[1]
+		key := test[2]["key"]
+		_, update, _, skip = handleSingleKey(key.(string), unstruct, &unstructObj, "musthave")
+		assert.Equal(t, update, test[2]["expect"])
+		assert.False(t, skip)
 	}
 }
