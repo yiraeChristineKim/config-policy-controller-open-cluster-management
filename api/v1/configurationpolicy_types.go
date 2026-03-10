@@ -452,6 +452,17 @@ type RelatedObject struct {
 type ConfigurationPolicyStatus struct {
 	ComplianceState ComplianceState `json:"compliant,omitempty"`
 
+	// AiOpinion is a best-effort policy review result. When ChatGPT/OpenAI review is enabled on the controller,
+	// this will be populated using ChatGPT based on a sanitized summary of the policy. Otherwise, this will contain
+	// a local Go-template lint summary.
+	AiOpinion string `json:"aiOpinion,omitempty"`
+
+	// AiOpinionGeneration is the generation of the ConfigurationPolicy object when AiOpinion was last set.
+	AiOpinionGeneration int64 `json:"aiOpinionGeneration,omitempty"`
+
+	// AiOpinionLastUpdated is an ISO-8601 timestamp of the last time AiOpinion was updated.
+	AiOpinionLastUpdated string `json:"aiOpinionLastUpdated,omitempty"`
+
 	// CompliancyDetails is a list of statuses matching one-to-one with each of the items in the
 	// `object-templates` array.
 	CompliancyDetails []TemplateStatus `json:"compliancyDetails,omitempty"`

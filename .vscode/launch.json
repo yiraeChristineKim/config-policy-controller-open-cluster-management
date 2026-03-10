@@ -19,6 +19,11 @@
             "env": {
                 "WATCH_NAMESPACE": "managed",
                 "KUBECONFIG": "${workspaceFolder}/kubeconfig_managed",
+                "OPENAI_POLICY_REVIEW_ENABLED": "true",
+                "OPENAI_API_KEY": "",
+                "OPENAI_ENDPOINT": "https://api.openai.com/v1/responses",
+                "OPENAI_TIMEOUT_SECONDS": "10",
+                "OPENAI_MAX_OUTPUT_TOKENS": "1000",
             }
         },
         // Run `make kind-bootstrap-cluster-dev` and `make kind-additional-cluster` before launching this.
@@ -39,7 +44,7 @@
             ],
             "env": {
                 "WATCH_NAMESPACE": "managed",
-                "KUBECONFIG": "${workspaceFolder}/kubeconfig_managed",
+                "KUBECONFIG": "${userHome}/.kube/config",
             }
         },
         // Set FDescribe or FIt on the test to debug. Then set the desired breakpoint.

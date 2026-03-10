@@ -431,6 +431,19 @@ spec:
                       type: string
                   type: object
                 type: array
+              aiOpinion:
+                description: |-
+                  AiOpinion is a best-effort policy review result. When ChatGPT/OpenAI review is enabled on the controller,
+                  this will be populated using ChatGPT based on a sanitized summary of the policy. Otherwise, this will contain
+                  a local Go-template lint summary.
+                type: string
+              aiOpinionGeneration:
+                description: AiOpinionGeneration is the generation of the ConfigurationPolicy object when AiOpinion was last set.
+                format: int64
+                type: integer
+              aiOpinionLastUpdated:
+                description: AiOpinionLastUpdated is an ISO-8601 timestamp of the last time AiOpinion was updated.
+                type: string
               lastEvaluated:
                 description: LastEvaluated is an ISO-8601 timestamp of the last time
                   the policy was evaluated.

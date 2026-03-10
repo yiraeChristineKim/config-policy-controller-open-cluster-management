@@ -4,10 +4,15 @@
 package controllers
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	stdjson "encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"reflect"
 	"regexp"
 	"sort"
@@ -781,6 +786,530 @@ func getFormattedTemplateErr(err error) (complianceMsg string, formattedErr erro
 	}
 
 	return err.Error(), err
+}
+
+const aiOpinionMaxLen = 4096
+
+const (
+	openAIEnabledEnv     = "OPENAI_POLICY_REVIEW_ENABLED"
+	openAIAPIKeyEnv      = "OPENAI_API_KEY"
+	openAIModelEnv       = "OPENAI_MODEL"
+	openAIEndpointEnv    = "OPENAI_ENDPOINT"
+	openAITimeoutSecsEnv = "OPENAI_TIMEOUT_SECONDS"
+	openAIMaxTokensEnv   = "OPENAI_MAX_OUTPUT_TOKENS"
+)
+
+func (r *ConfigurationPolicyReconciler) setAiOpinion(ctx context.Context, plc *policyv1.ConfigurationPolicy) {
+	if plc == nil {
+		return
+	}
+
+	if !openAIPolicyReviewEnabled() {
+		opinion := buildAiOpinion(plc)
+		if plc.Status.AiOpinion != opinion {
+			plc.Status.AiOpinion = opinion
+			plc.Status.AiOpinionGeneration = plc.Generation
+			plc.Status.AiOpinionLastUpdated = time.Now().UTC().Format(time.RFC3339)
+		}
+
+		return
+	}
+
+	// Avoid repeated external calls: only review once per generation.
+	if plc.Status.AiOpinionGeneration == plc.Generation && plc.Status.AiOpinion != "" {
+		// If evaluation has discovered template processing errors but the cached AI opinion still reports
+		// "TemplateErrors: - None", refresh even within the same generation.
+		if !(policyHasTemplateProcessingErrors(plc) && aiOpinionSaysNoTemplateErrors(plc.Status.AiOpinion)) {
+			return
+		}
+	}
+
+	opinion, err := chatGPTReviewPolicy(ctx, plc)
+	if err != nil {
+		opinion = fmt.Sprintf("ChatGPT: review failed: %v", err)
+	}
+
+	opinion = strings.TrimSpace(opinion)
+	if len(opinion) > aiOpinionMaxLen {
+		opinion = opinion[:aiOpinionMaxLen-14] + "...(truncated)"
+	}
+
+	plc.Status.AiOpinion = opinion
+	plc.Status.AiOpinionGeneration = plc.Generation
+	plc.Status.AiOpinionLastUpdated = time.Now().UTC().Format(time.RFC3339)
+}
+
+func policyHasTemplateProcessingErrors(plc *policyv1.ConfigurationPolicy) bool {
+	if plc == nil {
+		return false
+	}
+
+	for _, detail := range plc.Status.CompliancyDetails {
+		if len(detail.Conditions) == 0 {
+			continue
+		}
+
+		cond := detail.Conditions[0]
+		if cond.Reason == reasonTemplateError {
+			return true
+		}
+	}
+
+	return false
+}
+
+func aiOpinionSaysNoTemplateErrors(aiOpinion string) bool {
+	aiOpinion = strings.TrimSpace(aiOpinion)
+	if aiOpinion == "" {
+		return false
+	}
+
+	// We expect the AI output format:
+	// TemplateErrors:
+	// - None
+	lines := strings.Split(aiOpinion, "\n")
+	inSection := false
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			if inSection {
+				break
+			}
+			continue
+		}
+
+		if strings.EqualFold(line, "TemplateErrors:") {
+			inSection = true
+			continue
+		}
+
+		if !inSection {
+			continue
+		}
+
+		if strings.HasPrefix(line, "- ") {
+			bullet := strings.TrimSpace(strings.TrimPrefix(line, "- "))
+			return strings.EqualFold(bullet, "none") || bullet == ""
+		}
+	}
+
+	return false
+}
+
+func buildAiOpinion(plc *policyv1.ConfigurationPolicy) string {
+	if plc == nil {
+		return ""
+	}
+
+	disableTemplates := false
+	if disableAnnotation, ok := plc.Annotations[disableTemplatesAnnotation]; ok {
+		parsedDisable, err := strconv.ParseBool(disableAnnotation)
+		if err == nil {
+			disableTemplates = parsedDisable
+		}
+	}
+
+	if disableTemplates {
+		return "AI (local): templates disabled (policy.open-cluster-management.io/disable-templates=true)"
+	}
+
+	templatesPresent := false
+	hasIssues := false
+	var sections strings.Builder
+
+	appendIssues := func(section string, templateStr string) {
+		issue := templateDelimiterIssue(templateStr)
+		if issue == "" {
+			return
+		}
+
+		hasIssues = true
+		sections.WriteString(section)
+		sections.WriteString("\n- ")
+		sections.WriteString(issue)
+		sections.WriteString("\n\n")
+	}
+
+	if plc.Spec.ObjectTemplatesRaw != "" {
+		templatesPresent = true
+		appendIssues("spec.object-templates-raw", plc.Spec.ObjectTemplatesRaw)
+	}
+
+	for i, objectT := range plc.Spec.ObjectTemplates {
+		if objectT == nil || len(objectT.ObjectDefinition.Raw) == 0 {
+			continue
+		}
+
+		if !templates.HasTemplate(objectT.ObjectDefinition.Raw, "", true) {
+			continue
+		}
+
+		templatesPresent = true
+		appendIssues(fmt.Sprintf("spec.object-templates[%d].objectDefinition", i), string(objectT.ObjectDefinition.Raw))
+	}
+
+	if !templatesPresent {
+		return "AI (local): no templates detected"
+	}
+
+	if !hasIssues {
+		return "AI (local): template syntax looks OK"
+	}
+
+	opinion := strings.TrimSpace("AI (local): template syntax issues detected\n" + strings.TrimSpace(sections.String()))
+	if len(opinion) > aiOpinionMaxLen {
+		opinion = opinion[:aiOpinionMaxLen-14] + "...(truncated)"
+	}
+
+	return opinion
+}
+
+func templateDelimiterIssue(templateStr string) string {
+	// This is intentionally a lightweight, non-evaluating check. It only tries to catch obvious template syntax issues
+	// like unbalanced delimiters, without validating function availability or executing templates.
+	openCount := strings.Count(templateStr, "{{")
+	closeCount := strings.Count(templateStr, "}}")
+	if openCount == closeCount {
+		return ""
+	}
+
+	return fmt.Sprintf(
+		"unbalanced template delimiters: found %d '{{' and %d '}}'", openCount, closeCount,
+	)
+}
+
+type openAIResponsesRequest struct {
+	Model           string               `json:"model"`
+	Input           []openAIInputMessage `json:"input"`
+	MaxOutputTokens int                  `json:"max_output_tokens,omitempty"`
+	Temperature     float64              `json:"temperature,omitempty"`
+}
+
+type openAIInputMessage struct {
+	Role    string               `json:"role"`
+	Content []openAIInputContent `json:"content"`
+}
+
+type openAIInputContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type openAIResponsesResponse struct {
+	OutputText string `json:"output_text,omitempty"`
+	Output     []struct {
+		Content []struct {
+			Type string `json:"type,omitempty"`
+			Text string `json:"text,omitempty"`
+		} `json:"content,omitempty"`
+	} `json:"output,omitempty"`
+}
+
+type geminiPolicySummary struct {
+	APIVersion string `json:"apiVersion,omitempty"`
+	Kind       string `json:"kind,omitempty"`
+	Name       string `json:"name,omitempty"`
+	Namespace  string `json:"namespace,omitempty"`
+	Generation int64  `json:"generation,omitempty"`
+
+	RemediationAction   string                      `json:"remediationAction,omitempty"`
+	EvaluationInterval  policyv1.EvaluationInterval `json:"evaluationInterval,omitempty"`
+	PruneObjectBehavior string                      `json:"pruneObjectBehavior,omitempty"`
+	DisableTemplates    bool                        `json:"disableTemplates,omitempty"`
+	UsesEncryption      bool                        `json:"usesEncryption,omitempty"`
+
+	NamespaceSelector policyv1.Target `json:"namespaceSelector,omitempty"`
+
+	ObjectTemplatesRawPresent        bool   `json:"objectTemplatesRawPresent,omitempty"`
+	ObjectTemplatesRawTemplateSyntax string `json:"objectTemplatesRawTemplateSyntax,omitempty"`
+
+	ObjectTemplates []geminiObjectTemplateSummary `json:"objectTemplates,omitempty"`
+
+	// TemplateProcessingErrors contains sanitized summaries of template processing failures from the latest evaluation.
+	TemplateProcessingErrors []string `json:"templateProcessingErrors,omitempty"`
+}
+
+type geminiObjectTemplateSummary struct {
+	Index          int    `json:"index"`
+	ComplianceType string `json:"complianceType,omitempty"`
+	RecordDiff     string `json:"recordDiff,omitempty"`
+
+	HasTemplate bool   `json:"hasTemplate,omitempty"`
+	APIVersion  string `json:"apiVersion,omitempty"`
+	Kind        string `json:"kind,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Namespace   string `json:"namespace,omitempty"`
+}
+
+func openAIPolicyReviewEnabled() bool {
+	v := strings.TrimSpace(os.Getenv(openAIEnabledEnv))
+	if v == "" {
+		return true
+	}
+	enabled, err := strconv.ParseBool(v)
+
+	return err == nil && enabled
+}
+
+func openAITimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeoutSecs := 5
+	if v := strings.TrimSpace(os.Getenv(openAITimeoutSecsEnv)); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			timeoutSecs = parsed
+		}
+	}
+
+	return context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
+}
+
+func openAIMaxTokens() int {
+	maxTokens := 512
+	if v := strings.TrimSpace(os.Getenv(openAIMaxTokensEnv)); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			maxTokens = parsed
+		}
+	}
+
+	return maxTokens
+}
+
+func openAIEndpointAndModel() (endpoint string, model string) {
+	model = strings.TrimSpace(os.Getenv(openAIModelEnv))
+	if model == "" {
+		model = "gpt-4.1-mini"
+	}
+
+	endpoint = strings.TrimSpace(os.Getenv(openAIEndpointEnv))
+	if endpoint == "" {
+		endpoint = "https://api.openai.com/v1/responses"
+	}
+
+	return endpoint, model
+}
+
+func chatGPTReviewPolicy(ctx context.Context, plc *policyv1.ConfigurationPolicy) (string, error) {
+	apiKey := strings.TrimSpace(os.Getenv(openAIAPIKeyEnv))
+	if apiKey == "" {
+		return "", fmt.Errorf("%s is not set", openAIAPIKeyEnv)
+	}
+
+	ctx, cancel := openAITimeout(ctx)
+	defer cancel()
+
+	summary := buildGeminiPolicySummary(plc)
+	summaryJSON, err := stdjson.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal policy summary: %w", err)
+	}
+
+	systemInstruction := "You are an expert reviewer for Kubernetes ConfigurationPolicy security.\n\n" +
+		"Your job:\n" +
+		"1. Identify template syntax/lint errors\n" +
+		"2. Identify HIGH-RISK security issues\n\n" +
+		"HIGH-RISK issues include:\n" +
+		"- privileged: true containers\n" +
+		"- hostPath volumes\n" +
+		"- containers running as root (runAsUser: 0)\n" +
+		"- wildcard RBAC (* verbs/resources)\n" +
+		"- policies affecting all namespaces (\"*\")\n" +
+		"- remediationAction=enforce combined with destructive objects\n" +
+		"- cluster-wide privilege escalation\n\n" +
+		"Only report HIGH-RISK issues.\n" +
+		"Do not report low or medium risks.\n\n" +
+		"Output MUST follow this exact format:\n\n" +
+		"TemplateErrors:\n" +
+		"- <error> (or \"- None\")\n\n" +
+		"HighRiskWarnings:\n" +
+		"- <warning> (or \"- None\")"
+
+	userPrompt := "Check this ConfigurationPolicy summary for template syntax/lint errors and HIGH-RISK security issues only.\n\n" +
+		"Rules:\n" +
+		"- Treat template issues as errors only when the summary provides explicit template syntax issues (including templateProcessingErrors).\n" +
+		"- If templateProcessingErrors is present and non-empty, copy up to 3 entries verbatim into TemplateErrors bullets.\n" +
+		"- High-risk warnings should include a short reason (e.g., overly broad namespace selector + enforce + destructive pruning).\n" +
+		"- If no template errors or high-risk warnings apply, output \"- None\" in the relevant section.\n\n" +
+		"Policy summary JSON:\n" + string(summaryJSON)
+
+	endpoint, model := openAIEndpointAndModel()
+	reqBody := openAIResponsesRequest{
+		Model: model,
+		Input: []openAIInputMessage{
+			{
+				Role: "system",
+				Content: []openAIInputContent{
+					{Type: "input_text", Text: systemInstruction},
+				},
+			},
+			{
+				Role: "user",
+				Content: []openAIInputContent{
+					{Type: "input_text", Text: userPrompt},
+				},
+			},
+		},
+		MaxOutputTokens: openAIMaxTokens(),
+		Temperature:     0.2,
+	}
+
+	bodyBytes, err := stdjson.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal OpenAI request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to build OpenAI request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("OpenAI request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed reading OpenAI response: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		trimmed := strings.TrimSpace(string(respBody))
+		if len(trimmed) > 800 {
+			trimmed = trimmed[:800] + "...(truncated)"
+		}
+
+		return "", fmt.Errorf("OpenAI HTTP %d: %s", resp.StatusCode, trimmed)
+	}
+
+	var parsed openAIResponsesResponse
+	if err := stdjson.Unmarshal(respBody, &parsed); err != nil {
+		return "", fmt.Errorf("failed parsing OpenAI response: %w", err)
+	}
+
+	text := strings.TrimSpace(parsed.OutputText)
+	if text == "" && len(parsed.Output) > 0 && len(parsed.Output[0].Content) > 0 {
+		text = strings.TrimSpace(parsed.Output[0].Content[0].Text)
+	}
+
+	if text == "" {
+		trimmed := strings.TrimSpace(string(respBody))
+		if len(trimmed) > 800 {
+			trimmed = trimmed[:800] + "...(truncated)"
+		}
+
+		return "", fmt.Errorf("OpenAI returned no text: %s", trimmed)
+	}
+
+	return text, nil
+}
+
+func buildGeminiPolicySummary(plc *policyv1.ConfigurationPolicy) geminiPolicySummary {
+	disableTemplates := false
+	if disableAnnotation, ok := plc.Annotations[disableTemplatesAnnotation]; ok {
+		parsedDisable, err := strconv.ParseBool(disableAnnotation)
+		if err == nil {
+			disableTemplates = parsedDisable
+		}
+	}
+
+	summary := geminiPolicySummary{
+		APIVersion: plc.APIVersion,
+		Kind:       plc.Kind,
+		Name:       plc.Name,
+		Namespace:  plc.Namespace,
+		Generation: plc.Generation,
+
+		RemediationAction:   string(plc.Spec.RemediationAction),
+		EvaluationInterval:  plc.Spec.EvaluationInterval,
+		PruneObjectBehavior: string(plc.Spec.PruneObjectBehavior),
+		DisableTemplates:    disableTemplates,
+		UsesEncryption:      usesEncryption(plc),
+
+		NamespaceSelector: plc.Spec.NamespaceSelector,
+
+		ObjectTemplatesRawPresent: plc.Spec.ObjectTemplatesRaw != "",
+	}
+
+	if plc.Spec.ObjectTemplatesRaw != "" {
+		issue := templateDelimiterIssue(plc.Spec.ObjectTemplatesRaw)
+		if issue == "" {
+			summary.ObjectTemplatesRawTemplateSyntax = "OK"
+		} else {
+			summary.ObjectTemplatesRawTemplateSyntax = issue
+		}
+	}
+
+	for i, objectT := range plc.Spec.ObjectTemplates {
+		if objectT == nil {
+			continue
+		}
+
+		ot := geminiObjectTemplateSummary{
+			Index:          i,
+			ComplianceType: string(objectT.ComplianceType),
+			RecordDiff:     string(objectT.RecordDiffWithDefault()),
+			HasTemplate:    templates.HasTemplate(objectT.ObjectDefinition.Raw, "", true),
+		}
+
+		// Parse basic identifying info from objectDefinition without sending the full manifest.
+		if len(objectT.ObjectDefinition.Raw) > 0 {
+			var u unstructured.Unstructured
+			if err := u.UnmarshalJSON(objectT.ObjectDefinition.Raw); err == nil {
+				ot.APIVersion = u.GetAPIVersion()
+				ot.Kind = u.GetKind()
+				ot.Name = u.GetName()
+				ot.Namespace = u.GetNamespace()
+			}
+		}
+
+		summary.ObjectTemplates = append(summary.ObjectTemplates, ot)
+	}
+
+	// Add sanitized template processing errors from the last evaluation to help the AI report template issues
+	// without receiving raw manifests/templates.
+	for _, detail := range plc.Status.CompliancyDetails {
+		if len(detail.Conditions) == 0 {
+			continue
+		}
+
+		cond := detail.Conditions[0]
+		if cond.Reason != reasonTemplateError {
+			continue
+		}
+
+		if errSummary := sanitizeTemplateErrorMessage(cond.Message); errSummary != "" {
+			summary.TemplateProcessingErrors = append(summary.TemplateProcessingErrors, errSummary)
+			if len(summary.TemplateProcessingErrors) >= 3 {
+				break
+			}
+		}
+	}
+
+	return summary
+}
+
+func sanitizeTemplateErrorMessage(msg string) string {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return ""
+	}
+
+	// Try to only keep the actual parser error portion, and drop the embedded JSON/template content.
+	// Example input includes:
+	//   failed to parse ... }}}: template: tmpl:5: unexpected . after term ...
+	if idx := strings.LastIndex(msg, "template:"); idx >= 0 {
+		msg = strings.TrimSpace(msg[idx:])
+	}
+
+	// Keep it single-line and bounded.
+	msg = strings.ReplaceAll(msg, "\n", " ")
+	msg = strings.Join(strings.Fields(msg), " ")
+
+	return trimOneLine(msg, 240)
 }
 
 func (r *ConfigurationPolicyReconciler) resolveObjectTemplatesRaw(
@@ -3786,6 +4315,11 @@ func (r *ConfigurationPolicyReconciler) updatePolicyStatus(
 ) error {
 	log := ctrl.LoggerFrom(ctx)
 	updateTime := time.Now()
+
+	// Populate AI opinion after the evaluation has produced compliancyDetails/conditions so the AI can
+	// reference template processing errors without needing raw manifests.
+	r.setAiOpinion(ctx, policy)
+
 	message := r.customComplianceMessage(policy, log)
 
 	maxMessageLength := 4096
@@ -4024,12 +4558,14 @@ func (r *ConfigurationPolicyReconciler) customComplianceMessage(
 
 	// No custom template was provided for the current situation
 	if customTemplate == "" {
-		return defaultMessage
+		return injectAiOpinionIntoComplianceMessage(plc, defaultMessage)
 	}
 
 	customMessage, err := r.doCustomMessage(plc, log, customTemplate, defaultMessage)
 	if err != nil {
-		return fmt.Sprintf("%v (failure processing the custom message: %v)", defaultMessage, err.Error())
+		return injectAiOpinionIntoComplianceMessage(
+			plc, fmt.Sprintf("%v (failure processing the custom message: %v)", defaultMessage, err.Error()),
+		)
 	}
 
 	// Add the compliance prefix if not present (it is required by the framework)
@@ -4037,7 +4573,118 @@ func (r *ConfigurationPolicyReconciler) customComplianceMessage(
 		customMessage = string(plc.Status.ComplianceState) + "; " + customMessage
 	}
 
-	return customMessage
+	return injectAiOpinionIntoComplianceMessage(plc, customMessage)
+}
+
+func injectAiOpinionIntoComplianceMessage(plc *policyv1.ConfigurationPolicy, message string) string {
+	if plc == nil {
+		return message
+	}
+
+	// The governance-policy-framework expects the message to begin with the compliance state. Keep that invariant.
+	if plc.Status.ComplianceState == policyv1.UnknownCompliancy {
+		return message
+	}
+
+	ai := aiOpinionSummary(plc.Status.AiOpinion)
+	if ai == "" {
+		return message
+	}
+
+	prefix := string(plc.Status.ComplianceState)
+	prefixWithSep := prefix + "; "
+	if !strings.HasPrefix(message, prefix) {
+		// If something unexpected happens, don't risk breaking the required message format.
+		return message
+	}
+
+	var rest string
+	if strings.HasPrefix(message, prefixWithSep) {
+		rest = strings.TrimPrefix(message, prefixWithSep)
+	} else {
+		rest = strings.TrimPrefix(message, prefix)
+		rest = strings.TrimPrefix(rest, "; ")
+	}
+
+	if strings.HasPrefix(rest, "AI - ") {
+		return message
+	}
+
+	if strings.TrimSpace(rest) == "" {
+		return fmt.Sprintf("%s; AI - %s", prefix, ai)
+	}
+
+	return fmt.Sprintf("%s; AI - %s; %s", prefix, ai, rest)
+}
+
+func aiOpinionSummary(aiOpinion string) string {
+	aiOpinion = strings.TrimSpace(aiOpinion)
+	if aiOpinion == "" {
+		return ""
+	}
+
+	// Prefer the first high-risk warning bullet if present, otherwise the first template error bullet.
+	// If both are explicitly "None", return a short explicit "no issues" summary.
+	lines := strings.Split(aiOpinion, "\n")
+
+	extractFirstBullet := func(section string) (bullet string, sawNone bool) {
+		inSection := false
+		for _, raw := range lines {
+			line := strings.TrimSpace(raw)
+			if line == "" {
+				if inSection {
+					break
+				}
+				continue
+			}
+
+			if strings.EqualFold(line, section) {
+				inSection = true
+				continue
+			}
+
+			if !inSection {
+				continue
+			}
+
+			if strings.HasPrefix(line, "- ") {
+				bullet := strings.TrimSpace(strings.TrimPrefix(line, "- "))
+				if strings.EqualFold(bullet, "none") || bullet == "" {
+					return "", true
+				}
+
+				return bullet, false
+			}
+		}
+
+		return "", false
+	}
+
+	hrBullet, hrNone := extractFirstBullet("HighRiskWarnings:")
+	if hrBullet != "" {
+		return trimOneLine(hrBullet, 240)
+	}
+
+	tplBullet, tplNone := extractFirstBullet("TemplateErrors:")
+	if tplBullet != "" {
+		return trimOneLine("Template error: "+tplBullet, 240)
+	}
+
+	if hrNone && tplNone {
+		return "No template errors; no high-risk warnings"
+	}
+
+	return ""
+}
+
+func trimOneLine(s string, maxLen int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.TrimSpace(s)
+	if maxLen > 0 && len(s) > maxLen {
+		return s[:maxLen-14] + "...(truncated)"
+	}
+
+	return s
 }
 
 // doCustomMessage parses and executes the custom template, returning an error if something goes

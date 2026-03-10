@@ -1,0 +1,24 @@
+apiVersion: policy.open-cluster-management.io/v1
+kind: ConfigurationPolicy
+metadata:
+  name: ensure-pod-security-no
+  namespace: managed
+spec:
+  remediationAction: enforce
+  namespaceSelector:
+    include:
+      - default
+  object-templates:
+    - complianceType: mustnothave
+      objectDefinition:
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: privileged-test-mustnothave
+          namespace: default
+        spec:
+          containers:
+            - name: nginx
+              image: nginx
+              securityContext:
+                privileged: true
